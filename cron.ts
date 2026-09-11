@@ -54,6 +54,7 @@ interface CronJob {
   at?: string; // kind=daily，"HH:MM" 本机时区
   nextAt: number; // epoch ms
   createdAt: number;
+  onBusy?: "queue" | "cancel"; // 会话忙碌时：queue 排队（默认）/ cancel 取消本次触发
 }
 
 const ENTRY_TYPE = "local.cron.jobs.v1";
@@ -118,7 +119,7 @@ function formatJob(j: CronJob): string {
         ? `每天 ${j.at}`
         : "一次性";
   const at = new Date(j.nextAt).toLocaleString();
-  return `- [${j.id}] ${j.name}（${schedule}，下次 ${at}）：${j.prompt}`;
+  return `- [${j.id}] ${j.name}（${schedule}，${j.onBusy === "cancel" ? "忙时取消" : "忙时排队"}，下次 ${at}）：${j.prompt}`;
 }
 
 export default function cron(pi: CronPi) {
@@ -145,6 +146,7 @@ export default function cron(pi: CronPi) {
   }
 
   // 到点触发：一次性任务移除，周期任务从当前时刻顺延（错过只补跑一次）。
+  // 忙碌时按 on_busy 分流：queue=followUp 排队（默认）；cancel=取消本次（一次性任务移除、周期任务照常顺延）。
   async function fireDue(): Promise<void> {
     const now = Date.now();
     for (const job of [...jobs.values()]) {
@@ -154,9 +156,14 @@ export default function cron(pi: CronPi) {
         job.nextAt =
           job.kind === "daily" ? nextDailyAt(job.at as string, now) : now + (job.everySeconds as number) * 1000;
       persist();
+      const busy = !ctxRef?.isIdle?.();
+      if (busy && job.onBusy === "cancel") {
+        pi.logger?.warn?.(`cron 任务 ${job.id} 忙时取消本次触发（下次 ${new Date(job.nextAt).toLocaleString()}）`);
+        continue;
+      }
       const text = `⏰ 定时任务 [${job.name}] 触发，请执行：\n${job.prompt}`;
       try {
-        if (ctxRef?.isIdle?.()) await pi.sendUserMessage(text);
+        if (!busy) await pi.sendUserMessage(text);
         else await pi.sendUserMessage(text, { deliverAs: "followUp" });
       } catch (e) {
         pi.logger?.error?.(`cron 任务 ${job.id} 注入失败: ${String(e).slice(0, 200)}`);
@@ -173,13 +180,15 @@ export default function cron(pi: CronPi) {
     description:
       `在当前会话建立定时任务，到点后把 prompt 作为用户消息注入会话驱动执行。` +
       `every_seconds / daily_at（"HH:MM"，本机时区）/ once_in_seconds 三选一；` +
-      `最小间隔 ${MIN_SECONDS} 秒，任务随会话持久化。`,
+      `最小间隔 ${MIN_SECONDS} 秒，任务随会话持久化。` +
+      `on_busy：会话忙碌时策略，queue=排队等空闲（默认），cancel=取消本次触发。`,
     parameters: z.object({
       name: z.string(),
       prompt: z.string(),
       every_seconds: z.number().optional(),
       daily_at: z.string().optional(),
       once_in_seconds: z.number().optional(),
+      on_busy: z.string().optional(),
     }),
     async execute(_id: string, params: unknown) {
       try {
@@ -187,6 +196,10 @@ export default function cron(pi: CronPi) {
         const name = asStr(field(params, "name")).trim().slice(0, MAX_NAME);
         const prompt = asStr(field(params, "prompt")).trim().slice(0, MAX_PROMPT);
         if (!name || !prompt) return textContent("name 和 prompt 均必填且不能为空。");
+        const onBusy = asStr(field(params, "on_busy"));
+        if (onBusy !== "" && onBusy !== "queue" && onBusy !== "cancel") {
+          return textContent(`on_busy 仅支持 "queue"（排队）或 "cancel"（取消本次），收到：${onBusy}`);
+        }
         const sched = validateSchedule(params);
         const job: CronJob = {
           id: `${Date.now().toString(36)}-${(idSeq++).toString(36)}`,
@@ -196,6 +209,7 @@ export default function cron(pi: CronPi) {
           everySeconds: sched.everySeconds,
           at: sched.at,
           nextAt: sched.nextAt,
+          onBusy: onBusy === "" ? undefined : onBusy === "cancel" ? "cancel" : "queue",
           createdAt: Date.now(),
         };
         jobs.set(job.id, job);

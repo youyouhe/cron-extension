@@ -9,7 +9,7 @@
 - **三个 LLM 工具**：`cron_add`（新建）、`cron_list`（查看）、`cron_remove`（删除）
 - **`/cron` 命令**：手动列出当前会话的全部任务
 - **三种调度**：固定间隔（`every_seconds`）、每天定点（`daily_at`，"HH:MM"，本机时区）、一次性延时（`once_in_seconds`）
-- **到点执行**：任务以用户消息注入会话 —— 会话空闲时立即开新轮次执行；忙碌时以 `followUp` 排队，不打断进行中的工作
+- **到点执行**：任务以用户消息注入会话 —— 会话空闲时立即开新轮次执行；忙碌时按任务的 `on_busy` 策略分流：`queue`（默认）以 `followUp` 排队不打断当前工作，`cancel` 取消本次触发
 - **会话持久化**：任务写入会话文件（`appendEntry`），重启 / 切分支后自动恢复；错过的任务补跑一次，不堆积
 - **安全约束**：最小间隔 30 秒、单会话最多 32 个任务、定时器走 `ctx.setInterval` 托管通道（回调抛错只记日志，不会拖垮会话进程）
 
@@ -52,6 +52,7 @@ cp cron.ts /path/to/your/project/.omp/extensions/
 | `every_seconds` | number | 固定间隔秒数，≥30 |
 | `daily_at` | string | 每天定点，`"HH:MM"` 24 小时制，本机时区 |
 | `once_in_seconds` | number | 一次性延时秒数，≥30 |
+| `on_busy` | string | 会话忙碌时策略：`queue` 排队（默认）/ `cancel` 取消本次 |
 
 三个调度字段**必填其一，且只能填一个**。
 
@@ -59,4 +60,5 @@ cp cron.ts /path/to/your/project/.omp/extensions/
 
 - 触发粒度 5 秒：实际触发最多晚一个 tick
 - 周期任务到期后从当前时刻顺延；daily 任务错过则下次定点触发
+- 忙碌时 `cancel`：本次不执行、记 warn 日志 —— 一次性任务即被移除，周期任务照常顺延到下一期；空闲时该类任务正常直发
 - 任务的生命周期跟随会话：新会话从零开始，恢复的会话带回原任务
