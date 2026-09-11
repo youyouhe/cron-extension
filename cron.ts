@@ -177,9 +177,9 @@ export default function cron(pi: CronPi) {
     parameters: z.object({
       name: z.string(),
       prompt: z.string(),
-      every_seconds: z.number(),
-      daily_at: z.string(),
-      once_in_seconds: z.number(),
+      every_seconds: z.number().optional(),
+      daily_at: z.string().optional(),
+      once_in_seconds: z.number().optional(),
     }),
     async execute(_id: string, params: unknown) {
       try {
