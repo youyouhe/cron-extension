@@ -59,7 +59,7 @@ interface CronJob {
 
 const ENTRY_TYPE = "local.cron.jobs.v1";
 const TICK_MS = 5_000; // 到点检查粒度；实际触发最多晚一个 tick
-const MIN_SECONDS = 30; // 允许的最小间隔，防止刷屏烧 token
+const MIN_SECONDS = 5; // 允许的最小间隔；与 tick 粒度一致，再小会被 5s tick 吞掉且只烧 token
 const MAX_JOBS = 32;
 const MAX_PROMPT = 4_000;
 const MAX_NAME = 80;
