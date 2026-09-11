@@ -28,6 +28,7 @@ interface CronPi {
     number: () => ZodNode;
     object: (shape: Record<string, ZodNode>) => unknown;
   };
+  exec?: (command: string, args: string[], opts?: { cwd?: string }) => Promise<{ stdout: string; stderr: string; code: number }>;
   sendUserMessage: (
     content: string,
     options?: { deliverAs?: "followUp" | "steer" | "nextTurn" | "aside" },
@@ -39,7 +40,7 @@ interface CronPi {
     command: { description: string; handler: (args: unknown, ctx: CronCtx) => Promise<void> },
   ) => unknown;
   on: (event: string, handler: (event: unknown, ctx: CronCtx) => Promise<void>) => unknown;
-  logger?: { warn?: (msg: string) => void; error?: (msg: string) => void };
+  logger?: { warn?: (msg: string) => void; error?: (msg: string) => void; info?: (msg: string) => void };
 }
 
 // ---- 数据模型 ----
@@ -55,6 +56,8 @@ interface CronJob {
   nextAt: number; // epoch ms
   createdAt: number;
   onBusy?: "queue" | "cancel"; // 会话忙碌时：queue 排队（默认）/ cancel 取消本次触发
+  condition?: string; // "__TOKEN__ # <agent_id> # <endpoint>"：到点先 get_messages 判 count>0，空则跳过本次不进 LLM
+  tokenFile?: string; // 明文 token 文件路径，读首行
 }
 
 const ENTRY_TYPE = "local.cron.jobs.v1";
@@ -145,6 +148,76 @@ export default function cron(pi: CronPi) {
     jobs = new Map((latest?.jobs ?? []).filter((j) => j && j.id && typeof j.prompt === "string").map((j) => [j.id, j]));
   }
 
+  // MCP 条件门：condition 形如 "__TOKEN__ # <agent_id> # <endpoint>"。
+  // 到点先用 curl 走 streamable-http 调 harbor get_messages，判 count>0 才放行注入；
+  // count=0 / 解析失败 / 缺依赖 → fail-closed 跳过本次（不进 LLM），只顺延 nextAt。
+  // 返回 {go:boolean, detail?:string}；go=false 时本轮回整体跳过。
+  async function conditionGate(job: CronJob): Promise<{ go: boolean; detail?: string }> {
+    const spec = (job.condition ?? "").trim();
+    if (!spec) return { go: true }; // 无 condition：老行为，无条件注入
+    if (!pi.exec) return { go: false, detail: "pi.exec 不可用，跳过本次" };
+    // condition 模板形如：
+    //   __TOKEN__ placeholder + " # " + agent_id + " # " + endpoint
+    // 按 " # " 三段切分，极简而明确
+    const parts = spec.split(" # ");
+    if (parts.length !== 3) {
+      return { go: false, detail: `condition 需为 "__TOKEN__ # <agent_id> # <endpoint>"，收到 ${spec}` };
+    }
+    const [_tokenPh, agentId, endpoint] = parts.map((p) => p.trim());
+    let token = "";
+    try {
+      const tok = await pi.exec("head", ["-n1", job.tokenFile ?? ""]);
+      if (tok.code !== 0) return { go: false, detail: `读 token 失败: ${tok.stderr.trim()}` };
+      token = tok.stdout.trim();
+    } catch (e) {
+      return { go: false, detail: `读 token 文件失败: ${String(e)}` };
+    }
+    if (!token) return { go: false, detail: "token 为空" };
+
+    // 1) 建立 MCP streamable-http 会话拿到 mcp-session-id
+    const initRes = await pi.exec("curl", [
+      "-s", "-D", "-", "-o", "/dev/null", endpoint,
+      "-H", "Content-Type: application/json",
+      "-H", "Accept: application/json, text/event-stream",
+      "-d", JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "omp-cron", version: "1" } },
+      }),
+    ]);
+    const sidMatch = /mcp-session-id:\s*(\S+)/i.exec(initRes.stdout);
+    if (!sidMatch) return { go: false, detail: "initialize 未返回 mcp-session-id" };
+    const mcpSessionId = sidMatch[1];
+
+    // 2) notifications/initialized（可选，多数 server 不强求）
+    await pi.exec("curl", ["-s", "-o", "/dev/null", endpoint,
+      "-H", "Content-Type: application/json",
+      "-H", "Accept: application/json, text/event-stream",
+      "-H", `mcp-session-id: ${mcpSessionId}`,
+      "-d", JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    ]);
+
+    // 3) tools/call get_messages：判 count>0 决定是否唤醒
+    const call = await pi.exec("curl", ["-s", endpoint,
+      "-H", "Content-Type: application/json",
+      "-H", "Accept: application/json, text/event-stream",
+      "-H", `mcp-session-id: ${mcpSessionId}`,
+      "-d", JSON.stringify({
+        jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name: "get_messages", arguments: { agent_id: agentId, token, unread_only: true, limit: 20 } },
+      }),
+    ]);
+    // 从 SSE data: 行取最后一个 data: 的 JSON
+    const dataLines = call.stdout.split("\n").filter((l) => l.startsWith("data:"));
+    if (dataLines.length === 0) return { go: false, detail: "tools/call 无 data 行" };
+    const payload = JSON.parse(dataLines[dataLines.length - 1].slice(5).trim());
+    const contentArr = payload?.result?.content as Array<{ text?: string }> | undefined;
+    const text = (contentArr ?? []).map((c) => c.text ?? "").join("");
+    const inner = JSON.parse(text); // {messages:[...], count:N}
+    const count = Number(inner.count);
+    pi.logger?.info?.(`cron 任务 ${job.id} condition count=${count}`);
+    return { go: count > 0, detail: `count=${count}` };
+  }
+
   // 到点触发：一次性任务移除，周期任务从当前时刻顺延（错过只补跑一次）。
   // 忙碌时按 on_busy 分流：queue=followUp 排队（默认）；cancel=取消本次（一次性任务移除、周期任务照常顺延）。
   async function fireDue(): Promise<void> {
@@ -159,6 +232,12 @@ export default function cron(pi: CronPi) {
       const busy = !ctxRef?.isIdle?.();
       if (busy && job.onBusy === "cancel") {
         pi.logger?.warn?.(`cron 任务 ${job.id} 忙时取消本次触发（下次 ${new Date(job.nextAt).toLocaleString()}）`);
+        continue;
+      }
+      // 条件门：有 condition 且 count<=0 → 静默跳过，不进 LLM，只顺延
+      const gate = await conditionGate(job);
+      if (!gate.go) {
+        pi.logger?.info?.(`cron 任务 ${job.id} 条件未命中，跳过本次（${gate.detail ?? ""}，下次 ${new Date(job.nextAt).toLocaleString()}）`);
         continue;
       }
       const text = `⏰ 定时任务 [${job.name}] 触发，请执行：\n${job.prompt}`;
@@ -181,7 +260,9 @@ export default function cron(pi: CronPi) {
       `在当前会话建立定时任务，到点后把 prompt 作为用户消息注入会话驱动执行。` +
       `every_seconds / daily_at（"HH:MM"，本机时区）/ once_in_seconds 三选一；` +
       `最小间隔 ${MIN_SECONDS} 秒，任务随会话持久化。` +
-      `on_busy：会话忙碌时策略，queue=排队等空闲（默认），cancel=取消本次触发。`,
+      `on_busy：会话忙碌时策略，queue=排队等空闲（默认），cancel=取消本次触发。` +
+      `condition（可选）："__TOKEN__ # <agent_id> # <endpoint>" 三段，到点先 get_messages 判 count>0 才注入、count=0 静默跳过本次不进 LLM；` +
+      `tokenFile（可选）：明文 token 文件路径（读首行），注入 condition 的 __TOKEN__ 占位。`,
     parameters: z.object({
       name: z.string(),
       prompt: z.string(),
@@ -189,6 +270,8 @@ export default function cron(pi: CronPi) {
       daily_at: z.string().optional(),
       once_in_seconds: z.number().optional(),
       on_busy: z.string().optional(),
+      condition: z.string().optional(),
+      tokenFile: z.string().optional(),
     }),
     async execute(_id: string, params: unknown) {
       try {
@@ -200,6 +283,8 @@ export default function cron(pi: CronPi) {
         if (onBusy !== "" && onBusy !== "queue" && onBusy !== "cancel") {
           return textContent(`on_busy 仅支持 "queue"（排队）或 "cancel"（取消本次），收到：${onBusy}`);
         }
+        const condition = asStr(field(params, "condition")).trim();
+        const tokenFile = asStr(field(params, "tokenFile")).trim();
         const sched = validateSchedule(params);
         const job: CronJob = {
           id: `${Date.now().toString(36)}-${(idSeq++).toString(36)}`,
@@ -210,6 +295,8 @@ export default function cron(pi: CronPi) {
           at: sched.at,
           nextAt: sched.nextAt,
           onBusy: onBusy === "" ? undefined : onBusy === "cancel" ? "cancel" : "queue",
+          condition: condition || undefined,
+          tokenFile: tokenFile || undefined,
           createdAt: Date.now(),
         };
         jobs.set(job.id, job);
