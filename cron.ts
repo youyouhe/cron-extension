@@ -230,14 +230,14 @@ export default function cron(pi: CronPi) {
           job.kind === "daily" ? nextDailyAt(job.at as string, now) : now + (job.everySeconds as number) * 1000;
       persist();
       const busy = !ctxRef?.isIdle?.();
-      if (busy && job.onBusy === "cancel") {
-        pi.logger?.warn?.(`cron 任务 ${job.id} 忙时取消本次触发（下次 ${new Date(job.nextAt).toLocaleString()}）`);
-        continue;
-      }
-      // 条件门：有 condition 且 count<=0 → 静默跳过，不进 LLM，只顺延
+      // 条件门放最前：count<=0 直接静默跳过，不进 LLM，也不受 busy 影响
       const gate = await conditionGate(job);
       if (!gate.go) {
-        pi.logger?.info?.(`cron 任务 ${job.id} 条件未命中，跳过本次（${gate.detail ?? ""}，下次 ${new Date(job.nextAt).toLocaleString()}）`);
+        pi.logger?.warn?.(`cron 任务 ${job.id} 条件未命中，跳过本次（${gate.detail ?? ""}，下次 ${new Date(job.nextAt).toLocaleString()}）`);
+        continue;
+      }
+      if (busy && job.onBusy === "cancel") {
+        pi.logger?.warn?.(`cron 任务 ${job.id} 忙时取消本次触发（下次 ${new Date(job.nextAt).toLocaleString()}）`);
         continue;
       }
       const text = `⏰ 定时任务 [${job.name}] 触发，请执行：\n${job.prompt}`;
