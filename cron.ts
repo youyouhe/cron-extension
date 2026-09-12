@@ -1,4 +1,4 @@
-// 会话内定时任务插件：通过 cron_add / cron_list / cron_remove 工具
+// 会话内定时任务插件：通过 cron_add / cron_list / cron_remove 工具（或让模型代为调用）
 // 建立定时任务；到点后任务以用户消息注入会话 —— 空闲时立即开新轮次执行，
 // 忙碌时以 followUp 排队，不打断当前工作。
 // 持久化：任务随 appendEntry 写进会话文件，重启 / 切分支后自动恢复；
@@ -8,7 +8,7 @@
 //         终结整个进程，禁止使用。
 // 手动查看：/cron；删除本文件即卸载（需重启会话生效）。
 
-// ---- 与 opencode 运行时的结构化边界：只声明本扩展实际用到的方法 ----
+// ---- 与扩展运行时的结构化边界：只声明本扩展实际用到的方法 ----
 interface CronUi {
   notify?: (text: string, level?: string) => void;
 }
@@ -149,8 +149,9 @@ export default function cron(pi: CronPi) {
   }
 
   // MCP 条件门：condition 形如 "__TOKEN__ # <agent_id> # <endpoint>"。
-  // 到点先用 exec 走 curl 调 harbor get_messages，判 count>0 才放行注入；
+  // 到点先用 curl 走 streamable-http 调 harbor get_messages，判 count>0 才放行注入；
   // count=0 / 解析失败 / 缺依赖 → fail-closed 跳过本次（不进 LLM），只顺延 nextAt。
+  // 返回 {go:boolean, detail?:string}；go=false 时本轮回整体跳过。
   async function conditionGate(job: CronJob): Promise<{ go: boolean; detail?: string }> {
     const spec = (job.condition ?? "").trim();
     if (!spec) return { go: true }; // 无 condition：老行为，无条件注入
@@ -218,7 +219,7 @@ export default function cron(pi: CronPi) {
   }
 
   // 到点触发：一次性任务移除，周期任务从当前时刻顺延（错过只补跑一次）。
-  // 忙碌时按 on_busy 分流：queue=followUp 排队（默认）；cancel=取消本次触发
+  // 忙碌时按 on_busy 分流：queue=followUp 排队（默认）；cancel=取消本次（一次性任务移除、周期任务照常顺延）。
   async function fireDue(): Promise<void> {
     const now = Date.now();
     for (const job of [...jobs.values()]) {

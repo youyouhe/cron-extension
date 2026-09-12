@@ -2,7 +2,16 @@
 
 Agent 会话内定时任务插件：让 agent 在对话中建立定时任务，到点后自动驱动当前会话执行。
 
-单文件扩展，无构建步骤，无第三方依赖。兼容 opencode / Oh My Pi (omp) 等 agent 运行时。
+单文件扩展，无构建步骤，无第三方依赖。分别提供 opencode 和 Oh My Pi (omp) 两个版本。
+
+## 仓库结构
+
+```
+cron-extension/
+├── cron-opencode.ts    # opencode 版本
+├── cron-omp.ts         # Oh My Pi (omp) 版本
+└── README.md
+```
 
 ## 功能
 
@@ -19,11 +28,9 @@ Agent 会话内定时任务插件：让 agent 在对话中建立定时任务，�
 
 ### opencode
 
-将 `cron.ts` 复制到 opencode 配置目录即可：
-
 ```bash
 git clone https://github.com/youyouhe/cron-extension.git
-cp cron-extension/cron.ts ~/.config/opencode/cron.ts
+cp cron-extension/cron-opencode.ts ~/.config/opencode/cron.ts
 ```
 
 重启 opencode 会话生效。
@@ -35,11 +42,11 @@ git clone https://github.com/youyouhe/cron-extension.git
 cd cron-extension
 
 # 全局安装：所有 omp 会话加载
-ln -s "$(pwd)/cron.ts" ~/.omp/agent/extensions/cron.ts
+ln -s "$(pwd)/cron-omp.ts" ~/.omp/agent/extensions/cron.ts
 
 # 或项目级安装
 mkdir -p /path/to/your/project/.omp/extensions
-cp cron.ts /path/to/your/project/.omp/extensions/
+cp cron-omp.ts /path/to/your/project/.omp/extensions/
 ```
 
 重启 omp 会话生效。
