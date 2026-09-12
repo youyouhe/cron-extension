@@ -12,6 +12,8 @@
 - **到点执行**：任务以用户消息注入会话 —— 会话空闲时立即开新轮次执行；忙碌时按任务的 `on_busy` 策略分流：`queue`（默认）以 `followUp` 排队不打断当前工作，`cancel` 取消本次触发
 - **会话持久化**：任务写入会话文件（`appendEntry`），重启 / 切分支后自动恢复；错过的任务补跑一次，不堆积
 - **安全约束**：最小间隔 5 秒（与触发粒度一致）、单会话最多 32 个任务、定时器走 `ctx.setInterval` 托管通道（回调抛错只记日志，不会拖垮会话进程）
+- **条件门控**：可选 `condition` 参数 `"__TOKEN__ # <agent_id> # <endpoint>"`，到点先 `get_messages` 判 `count>0` 才注入、count=0 静默跳过本次不进 LLM
+- **Token 支持**：可选 `tokenFile` 明文 token 文件路径，读首行作为 `condition` 中的 `__TOKEN__` 占位
 
 ## 安装
 
@@ -53,6 +55,8 @@ cp cron.ts /path/to/your/project/.omp/extensions/
 | `daily_at` | string | 每天定点，`"HH:MM"` 24 小时制，本机时区 |
 | `once_in_seconds` | number | 一次性延时秒数，≥5 |
 | `on_busy` | string | 会话忙碌时策略：`queue` 排队（默认）/ `cancel` 取消本次 |
+| `condition` | string | 可选，`"__TOKEN__ # <agent_id> # <endpoint>"` 三段，到点先 get_messages 判 count>0 才注入、count=0 静默跳过本次不进 LLM |
+| `tokenFile` | string | 可选，明文 token 文件路径（读首行），注入 condition 的 `__TOKEN__` 占位 |
 
 三个调度字段**必填其一，且只能填一个**。
 
@@ -62,3 +66,5 @@ cp cron.ts /path/to/your/project/.omp/extensions/
 - 周期任务到期后从当前时刻顺延；daily 任务错过则下次定点触发
 - 忙碌时 `cancel`：本次不执行、记 warn 日志 —— 一次性任务即被移除，周期任务照常顺延到下一期；空闲时该类任务正常直发
 - 任务的生命周期跟随会话：新会话从零开始，恢复的会话带回原任务
+- 条件门控：`count<=0` 时跳过本次触发，不进 LLM，也不受 busy 状态影响
+- tokenFile：用于 condition 表达式中的 `__TOKEN__` 占位，读取文件首行内容
